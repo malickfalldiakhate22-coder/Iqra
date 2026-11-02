@@ -9,7 +9,39 @@ on:
         required: false
         default: ""
 jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Vérifier la connexion à R2 (1 minute)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        shell: bash
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null
+          A="$(printf %s "$R2_ACCOUNT_ID" | tr -d '[:space:]' | sed -E 's#^https?://##; s#[./].*$##')"
+          B="$(printf %s "$R2_BUCKET" | tr -d '[:space:]/')"
+          K="$(printf %s "$R2_ACCESS_KEY_ID" | tr -d '[:space:]')"; S="$(printf %s "$R2_SECRET_ACCESS_KEY" | tr -d '[:space:]')"
+          echo "Account ID : ${#A} caractères (doit être 32) · commence par ${A:0:4}…"
+          echo "Bucket     : '$B' (doit être iqra-audio)"
+          echo "Access Key : ${#K} caractères (doit être 32)"
+          echo "Secret Key : ${#S} caractères (doit être 64)"
+          export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare RCLONE_CONFIG_R2_ACCESS_KEY_ID="$K" RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$S" RCLONE_CONFIG_R2_ENDPOINT="https://$A.r2.cloudflarestorage.com" RCLONE_CONFIG_R2_ACL=private
+          echo ok > test.txt
+          if rclone copyto test.txt "r2:$B/_test-iqra.txt" --s3-no-check-bucket --s3-no-head -v 2>&1 | tee log.txt; [ "${PIPESTATUS[0]}" = 0 ]; then
+            echo "✅ CONNEXION À R2 RÉUSSIE"
+          else
+            echo "❌ ÉCHEC — envoie une capture de ces lignes."
+            grep -q "InvalidAccessKeyId\|Unauthorized\|SignatureDoesNotMatch" log.txt && echo "→ Access Key ou Secret Key incorrecte."
+            grep -q "AccessDenied" log.txt && echo "→ La clé n'a pas le droit d'écrire dans ce bucket (Object Read & Write sur iqra-audio)."
+            grep -q "NoSuchBucket" log.txt && echo "→ Nom du bucket incorrect."
+            grep -qi "no such host\|dial tcp\|lookup" log.txt && echo "→ Account ID incorrect."
+            exit 1
+          fi
   prep:
+    needs: verifier
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -43,7 +75,7 @@ jobs:
           command -v ffmpeg >/dev/null || { echo "Installe ffmpeg d'abord"; exit 1; }
 
           UPLOAD=0
-          R2_ACCOUNT_ID="$(printf %s "${R2_ACCOUNT_ID:-}" | sed -E 's#^https?://##; s#\..*$##' | tr -d '[:space:]')"
+          R2_ACCOUNT_ID="$(printf %s "${R2_ACCOUNT_ID:-}" | tr -d '[:space:]' | sed -E 's#^https?://##; s#[./].*$##')"
           R2_BUCKET="$(printf %s "${R2_BUCKET:-}" | tr -d '[:space:]/')"
           R2_ACCESS_KEY_ID="$(printf %s "${R2_ACCESS_KEY_ID:-}" | tr -d '[:space:]')"; R2_SECRET_ACCESS_KEY="$(printf %s "${R2_SECRET_ACCESS_KEY:-}" | tr -d '[:space:]')"
           if [ -n "${R2_ACCOUNT_ID:-}" ] && [ -n "${R2_BUCKET:-}" ]; then
