@@ -1,0 +1,73 @@
+# Iqra — envoie toutes les récitations dans Cloudflare R2 (fichier unique, à coller dans GitHub)
+# Chemin du fichier dans GitHub : .github/workflows/recitations.yml
+name: Envoyer les recitations vers R2
+on:
+  workflow_dispatch:
+    inputs:
+      recitateurs:
+        description: "Récitateurs séparés par des espaces (vide = tous)"
+        required: false
+        default: ""
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        rec: [husary, husarymuallim, minshawi, abdulsamad, alafasy, abdurrahmaansudais, saoodshuraym, mahermuaiqly]
+    steps:
+      - name: Choix
+        id: pick
+        run: |
+          L="${{ github.event.inputs.recitateurs }}"
+          if [ -z "$L" ] || [[ " $L " == *" ${{ matrix.rec }} "* ]]; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "go=0" >> "$GITHUB_OUTPUT"; fi
+      - name: Outils
+        if: steps.pick.outputs.go == '1'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg && curl -fsSL https://rclone.org/install.sh | sudo bash
+      - name: Préparer et envoyer
+        if: steps.pick.outputs.go == '1'
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        shell: bash
+        run: |
+          set -- ${{ matrix.rec }}
+          set -euo pipefail
+          RECS=("$@"); [ ${#RECS[@]} -eq 0 ] && RECS=(husary husarymuallim minshawi abdulsamad alafasy abdurrahmaansudais saoodshuraym mahermuaiqly)
+          SRC="https://github.com/Mohamedd-Ashraf/quran-surah-reciter-audio/releases/download"
+          OUT="${OUT:-audio}"; TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+          command -v ffmpeg >/dev/null || { echo "Installe ffmpeg d'abord"; exit 1; }
+
+          UPLOAD=0
+          if [ -n "${R2_ACCOUNT_ID:-}" ] && [ -n "${R2_BUCKET:-}" ]; then
+            command -v rclone >/dev/null || { echo "Installe rclone d'abord (https://rclone.org/install/)"; exit 1; }
+            export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
+                   RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+                   RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" RCLONE_CONFIG_R2_ACL=private
+            UPLOAD=1
+          fi
+
+          for r in "${RECS[@]}"; do
+            mkdir -p "$OUT/$r"; echo "== $r"
+            for s in $(seq 1 114); do
+              f=$(printf "%03d" "$s"); dst="$OUT/$r/$f.mp3"
+              [ -s "$dst" ] && continue
+              for try in 1 2 3; do
+                curl -fsSL --retry 3 -o "$TMP/in.mp3" "$SRC/surah-reciter-ar.$r/$f.mp3" && break
+                echo "  nouvel essai $r/$f ($try)"; sleep 5
+              done
+              ffmpeg -nostdin -loglevel error -y -i "$TMP/in.mp3" -map_metadata -1 -vn -ac 1 -ar 22050 -b:a 32k "$TMP/out.mp3"
+              mv "$TMP/out.mp3" "$dst"; printf "  %s ✓\r" "$f"
+            done
+            echo
+            if [ $UPLOAD -eq 1 ]; then
+              echo "  envoi vers R2…"
+              rclone copy "$OUT/$r" "r2:$R2_BUCKET/$r" --transfers 8 --s3-no-check-bucket \
+                --header-upload "Content-Type: audio/mpeg" --header-upload "Cache-Control: public, max-age=31536000, immutable"
+            fi
+          done
+          echo "Terminé."
